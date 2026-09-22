@@ -5,21 +5,56 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-/// Доступные форматы выходного аудио
+/// Доступные форматы выходного медиафайла
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AudioFormat {
+enum MediaFormat {
     Mp3,
     Wav,
+    Mp4,
+    Mkv,
 }
 
-/// Конфигурация обработки аудиофайла
+impl MediaFormat {
+    fn from_ext(ext: &str) -> Option<Self> {
+        match ext.to_lowercase().as_str() {
+            "mp3" => Some(MediaFormat::Mp3),
+            "wav" => Some(MediaFormat::Wav),
+            "mp4" => Some(MediaFormat::Mp4),
+            "mkv" => Some(MediaFormat::Mkv),
+            _ => None,
+        }
+    }
+
+    fn as_ext(&self) -> &'static str {
+        match self {
+            MediaFormat::Mp3 => "mp3",
+            MediaFormat::Wav => "wav",
+            MediaFormat::Mp4 => "mp4",
+            MediaFormat::Mkv => "mkv",
+        }
+    }
+
+    fn is_video(&self) -> bool {
+        matches!(self, MediaFormat::Mp4 | MediaFormat::Mkv)
+    }
+
+    fn default_codec(&self) -> &'static str {
+        match self {
+            MediaFormat::Mp3 => "libmp3lame",
+            MediaFormat::Wav => "pcm_s16le",
+            MediaFormat::Mp4 | MediaFormat::Mkv => "libx264",
+        }
+    }
+}
+
+/// Конфигурация обработки медиафайла
 #[derive(Debug, Clone)]
 struct AppConfig {
     input_path: PathBuf,
     output_path: PathBuf,
     noise_threshold_db: f32, // Порог шума/тишины в дБ (например, -35.0)
     min_silence_sec: f32,    // Минимальная длительность тишины для удаления (сек)
-    output_format: AudioFormat,
+    output_format: MediaFormat,
     ai_transcribe: bool,     // Включить расшифровку через ИИ
     groq_api_key: Option<String>,
     gemini_api_key: Option<String>,
@@ -31,30 +66,6 @@ struct AppConfig {
 struct FfmpegPaths {
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
-}
-
-impl AudioFormat {
-    fn from_ext(ext: &str) -> Option<Self> {
-        match ext.to_lowercase().as_str() {
-            "mp3" => Some(AudioFormat::Mp3),
-            "wav" => Some(AudioFormat::Wav),
-            _ => None,
-        }
-    }
-
-    fn as_ext(&self) -> &'static str {
-        match self {
-            AudioFormat::Mp3 => "mp3",
-            AudioFormat::Wav => "wav",
-        }
-    }
-
-    fn default_codec(&self) -> &'static str {
-        match self {
-            AudioFormat::Mp3 => "libmp3lame",
-            AudioFormat::Wav => "pcm_s16le",
-        }
-    }
 }
 
 /// Автоматически скачивает FFmpeg в локальную папку `ffmpeg_bin`, если он не установлен
@@ -203,7 +214,7 @@ fn get_file_duration(path: &Path, paths: &FfmpegPaths) -> Result<f32, String> {
     stdout.trim().parse::<f32>().map_err(|_| "Ошибка парсинга длительности".to_string())
 }
 
-/// Конструирует фильтр `silenceremove` с мгновенной реакцией на речь и мягким отступом
+/// Конструирует фильтр `silenceremove` для аудио
 fn build_silence_filter(config: &AppConfig) -> String {
     format!(
         "silenceremove=start_periods=1:start_duration=0.02:start_threshold={:.1}dB:start_silence=0.15:stop_periods=-1:stop_duration={:.2}:stop_threshold={:.1}dB:stop_silence=0.15",
@@ -213,9 +224,9 @@ fn build_silence_filter(config: &AppConfig) -> String {
     )
 }
 
-/// Выполняет обработку файла
+/// Выполняет быструю обработку чистого аудиофайла
 fn process_audio_file(config: &AppConfig, paths: &FfmpegPaths) -> Result<(), String> {
-    println!("▶ Обработка файла: {}", config.input_path.display());
+    println!("▶ Обработка аудиофайла: {}", config.input_path.display());
     
     let filter_str = build_silence_filter(config);
 
@@ -223,12 +234,13 @@ fn process_audio_file(config: &AppConfig, paths: &FfmpegPaths) -> Result<(), Str
     cmd.arg("-y") // Перезапись без запроса
        .arg("-i")
        .arg(&config.input_path)
+       .arg("-vn") // Игнорировать видеопоток
        .arg("-af")
        .arg(&filter_str)
        .arg("-c:a")
        .arg(config.output_format.default_codec());
 
-    if config.output_format == AudioFormat::Mp3 {
+    if config.output_format == MediaFormat::Mp3 {
         cmd.arg("-b:a").arg("192k");
     }
 
@@ -244,9 +256,166 @@ fn process_audio_file(config: &AppConfig, paths: &FfmpegPaths) -> Result<(), Str
     Ok(())
 }
 
-/// Отправляет аудиофайл в Groq Whisper API (Whisper-Large-V3) для супербыстрого распознавания речи
+/// Сканирует видеофайл и возвращает интервалы тишины (start, end)
+fn detect_silence_intervals(
+    input_path: &Path,
+    db: f32,
+    min_silence: f32,
+    paths: &FfmpegPaths,
+) -> Result<Vec<(f32, f32)>, String> {
+    println!("🔍 Сканирование тишины в видеопотоке...");
+
+    let output = Command::new(&paths.ffmpeg)
+        .args([
+            "-hide_banner",
+            "-i",
+            input_path.to_str().ok_or("Недопустимый путь к файлу")?,
+            "-af",
+            &format!("silencedetect=noise={:.1}dB:d={:.2}", db, min_silence),
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map_err(|e| format!("Ошибка запуска FFmpeg silencedetect: {}", e))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut silences: Vec<(f32, f32)> = Vec::new();
+    let mut current_start: Option<f32> = None;
+
+    for line in stderr.lines() {
+        if line.contains("silence_start:") {
+            if let Some(pos) = line.find("silence_start:") {
+                let rest = line[pos + "silence_start:".len()..].trim();
+                if let Some(val) = rest.split_whitespace().next().and_then(|s| s.parse::<f32>().ok()) {
+                    current_start = Some(val);
+                }
+            }
+        } else if line.contains("silence_end:") {
+            if let (Some(start), Some(pos)) = (current_start, line.find("silence_end:")) {
+                let rest = line[pos + "silence_end:".len()..].trim();
+                if let Some(val) = rest.split_whitespace().next().and_then(|s| s.parse::<f32>().ok()) {
+                    silences.push((start, val));
+                    current_start = None;
+                }
+            }
+        }
+    }
+
+    Ok(silences)
+}
+
+/// Вычисляет отрезки с речью на основе обнаруженной тишины
+fn compute_keep_intervals(silences: &[(f32, f32)], total_duration: f32) -> Vec<(f32, f32)> {
+    let mut keeps = Vec::new();
+    let mut current_pos = 0.0;
+
+    for &(s_start, s_end) in silences {
+        if s_start > current_pos + 0.05 {
+            keeps.push((current_pos, s_start));
+        }
+        current_pos = s_end;
+    }
+
+    if total_duration > current_pos + 0.05 {
+        keeps.push((current_pos, total_duration));
+    }
+
+    keeps
+}
+
+/// Выполняет синхронный монтаж ВИДЕО и АУДИО
+fn process_video_file(config: &AppConfig, paths: &FfmpegPaths, total_duration: f32) -> Result<(), String> {
+    let silences = detect_silence_intervals(&config.input_path, config.noise_threshold_db, config.min_silence_sec, paths)?;
+    let keeps = compute_keep_intervals(&silences, total_duration);
+
+    if keeps.is_empty() {
+        return Err("В видеофайле обнаружена только тишина!".to_string());
+    }
+
+    if silences.is_empty() {
+        println!("ℹ️ Тишина не обнаружена. Копирование файла без изменений...");
+        fs::copy(&config.input_path, &config.output_path)
+            .map_err(|e| format!("Ошибка копирования файла: {}", e))?;
+        return Ok(());
+    }
+
+    println!("✂️ Нарезка и склейка {} фрагментов видео и аудио...", keeps.len());
+
+    let mut filter_script = String::new();
+    let mut concat_inputs = String::new();
+
+    for (i, (start, end)) in keeps.iter().enumerate() {
+        filter_script.push_str(&format!(
+            "[0:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS[v{}];\n",
+            start, end, i
+        ));
+        filter_script.push_str(&format!(
+            "[0:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS[a{}];\n",
+            start, end, i
+        ));
+        concat_inputs.push_str(&format!("[v{}][a{}]", i, i));
+    }
+
+    filter_script.push_str(&format!(
+        "{}concat=n={}:v=1:a=1[outv][outa]\n",
+        concat_inputs,
+        keeps.len()
+    ));
+
+    // Использование файла скрипта избегает ограничений Windows на длину командной строки
+    let script_path = env::temp_dir().join(format!("silence_filter_{}.txt", std::process::id()));
+    fs::write(&script_path, &filter_script)
+        .map_err(|e| format!("Ошибка записи файла скрипта фильтра: {}", e))?;
+
+    let mut cmd = Command::new(&paths.ffmpeg);
+    cmd.arg("-y")
+       .arg("-i").arg(&config.input_path)
+       .arg("-filter_complex_script").arg(&script_path)
+       .arg("-map").arg("[outv]")
+       .arg("-map").arg("[outa]")
+       .arg("-c:v").arg("libx264")
+       .arg("-preset").arg("fast")
+       .arg("-crf").arg("22")
+       .arg("-c:a").arg("aac")
+       .arg("-b:a").arg("192k")
+       .arg(&config.output_path);
+
+    let output = cmd.output().map_err(|e| format!("Ошибка запуска FFmpeg: {}", e))?;
+    let _ = fs::remove_file(script_path);
+
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("FFmpeg завершился с ошибкой при монтаже видео:\n{}", err_msg));
+    }
+
+    Ok(())
+}
+
+/// Извлекает временный MP3 файл из видео для ИИ-распознавания речи
+fn extract_temp_audio_for_stt(media_path: &Path, paths: &FfmpegPaths) -> Result<PathBuf, String> {
+    let temp_mp3 = env::temp_dir().join(format!("stt_temp_{}.mp3", std::process::id()));
+    let output = Command::new(&paths.ffmpeg)
+        .args([
+            "-y",
+            "-i", media_path.to_str().ok_or("Недопустимый путь")?,
+            "-vn",
+            "-acodec", "libmp3lame",
+            "-q:a", "4",
+            temp_mp3.to_str().ok_or("Недопустимый путь temp")?,
+        ])
+        .output()
+        .map_err(|e| format!("Ошибка экспорта аудио для ИИ: {}", e))?;
+
+    if !output.status.success() {
+        return Err("Не удалось извлечь аудиодорожку для ИИ-расшифровки.".to_string());
+    }
+    Ok(temp_mp3)
+}
+
+/// Отправляет аудиофайл в Groq Whisper API (Whisper-Large-V3)
 fn transcribe_with_groq(audio_path: &Path, api_key: &str) -> Result<String, String> {
-    println!("⚡ Выполняем сверхбыстрое распознавание речи через Groq Whisper API...");
+    println!("⚡ Выполняем распознавание речи через Groq Whisper API...");
 
     let file_arg = format!("file=@{}", audio_path.display());
 
@@ -289,11 +458,11 @@ fn transcribe_with_groq(audio_path: &Path, api_key: &str) -> Result<String, Stri
     Err(format!("Не удалось распарсить ответ от Groq API:\n{}", response_text))
 }
 
-/// Улучшает и форматирует полученный текст через DeepSeek API
+/// Улучшает и форматирует текст через DeepSeek API
 fn polish_text_with_deepseek(raw_text: &str, api_key: &str) -> Result<String, String> {
     println!("🧠 Редактируем и расставляем знаки препинания через DeepSeek API...");
 
-    let temp_json_path = env::temp_dir().join("deepseek_req.json");
+    let temp_json_path = env::temp_dir().join(format!("deepseek_req_{}.json", std::process::id()));
     let safe_text = raw_text.replace('"', "\\\"").replace('\n', "\\n");
 
     let json_body = format!(
@@ -349,21 +518,19 @@ fn print_usage(exe_name: &str) {
     println!("                              • normal (-35 dB) - комната/микрофон (стандарт)");
     println!("                              • noisy  (-25 dB) - шумное помещение");
     println!("     -m, --min-sec <число>    Мин. длительность тишины в сек (по умолчанию: 0.4)");
-    println!("     -f, --format <mp3|wav>   Формат файла (mp3 или wav)");
+    println!("     -f, --format <mp3|wav|mp4|mkv>  Формат файла (по умолчанию: определяется автоматически)");
     println!("     -t, --transcribe         Включить ИИ-распознавание речи в .txt");
-    println!("     --groq-key <ключ>        API ключ Groq Whisper (перем. среды GROQ_API_KEY) [Рекомендуется]");
+    println!("     --groq-key <ключ>        API ключ Groq Whisper (перем. среды GROQ_API_KEY)");
     println!("     --gemini-key <ключ>      API ключ Gemini (перем. среды GEMINI_API_KEY)");
     println!("     --deepseek-key <ключ>    API ключ DeepSeek для постобработки текста");
     println!("     -h, --help               Показать это руководство\n");
 }
 
-/// Удаляет кавычки при перетаскивании файла в консоль
 fn sanitize_path(path_str: &str) -> PathBuf {
     let trimmed = path_str.trim().trim_matches(|c| c == '"' || c == '\'');
     PathBuf::from(trimmed)
 }
 
-/// Ожидание нажатия Enter перед закрытием консоли
 fn wait_for_key() {
     println!("\nНажмите Enter, чтобы закрыть окно...");
     let mut input = String::new();
@@ -409,6 +576,27 @@ fn parse_args() -> Result<Option<(AppConfig, bool)>, String> {
             return Err(format!("Файл не найден: {}", input_path.display()));
         }
 
+        let is_input_video = input_path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "mov" | "avi" | "webm"))
+            .unwrap_or(false);
+
+        let mut output_format = if is_input_video { MediaFormat::Mp4 } else { MediaFormat::Mp3 };
+
+        if is_input_video {
+            println!("\n🎬 Обнаружен видеофайл!");
+            println!("  [1] Сохранить как ВИДЕО (.mp4) — обрезка видео и звука (по умолчанию)");
+            println!("  [2] Извлечь только АУДИО (.mp3) — быстрая нарезка звука");
+            print!("Ваш выбор [1-2]: ");
+            io::stdout().flush().ok();
+
+            let mut fmt_line = String::new();
+            io::stdin().read_line(&mut fmt_line).ok();
+            if fmt_line.trim() == "2" {
+                output_format = MediaFormat::Mp3;
+            }
+        }
+
         println!("\nВыберите пресет чувствительности:");
         println!("  [1] normal (-35 dB) - Стандарт для речи (по умолчанию)");
         println!("  [2] pure   (-50 dB) - Только абсолютная тишина");
@@ -425,7 +613,6 @@ fn parse_args() -> Result<Option<(AppConfig, bool)>, String> {
             _ => -35.0,
         };
 
-        // Спрашиваем про расшифровку в текст
         print!("\n📝 Выполнить ИИ-расшифровку речи в .txt файл? (y/n / д/н): ");
         io::stdout().flush().ok();
 
@@ -470,14 +657,14 @@ fn parse_args() -> Result<Option<(AppConfig, bool)>, String> {
         }
 
         let stem = input_path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-        let output_path = input_path.with_file_name(format!("{}_clean.mp3", stem));
+        let output_path = input_path.with_file_name(format!("{}_clean.{}", stem, output_format.as_ext()));
 
         let config = AppConfig {
             input_path,
             output_path,
             noise_threshold_db,
             min_silence_sec: 0.4,
-            output_format: AudioFormat::Mp3,
+            output_format,
             ai_transcribe,
             groq_api_key: groq_key,
             gemini_api_key: gemini_key,
@@ -491,7 +678,7 @@ fn parse_args() -> Result<Option<(AppConfig, bool)>, String> {
     let mut positional_args: Vec<PathBuf> = Vec::new();
     let mut noise_threshold_db: f32 = -35.0;
     let mut min_silence_sec: f32 = 0.4;
-    let mut custom_format: Option<AudioFormat> = None;
+    let mut custom_format: Option<MediaFormat> = None;
     let mut ai_transcribe = false;
     let mut groq_api_key = env::var("GROQ_API_KEY").ok();
     let mut gemini_api_key = env::var("GEMINI_API_KEY").ok();
@@ -530,7 +717,7 @@ fn parse_args() -> Result<Option<(AppConfig, bool)>, String> {
             "--format" | "-f" => {
                 idx += 1;
                 if idx < filtered_args.len() {
-                    custom_format = AudioFormat::from_ext(&filtered_args[idx]);
+                    custom_format = MediaFormat::from_ext(&filtered_args[idx]);
                 }
             }
             "--transcribe" | "-t" => {
@@ -580,10 +767,15 @@ fn parse_args() -> Result<Option<(AppConfig, bool)>, String> {
     } else if let Some(ref path) = output_path_opt {
         path.extension()
             .and_then(|ext| ext.to_str())
-            .and_then(AudioFormat::from_ext)
-            .unwrap_or(AudioFormat::Mp3)
+            .and_then(MediaFormat::from_ext)
+            .unwrap_or(MediaFormat::Mp3)
     } else {
-        AudioFormat::Mp3
+        let is_video = input_path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_lowercase().as_str(), "mp4" | "mkv" | "mov" | "avi" | "webm"))
+            .unwrap_or(false);
+
+        if is_video { MediaFormat::Mp4 } else { MediaFormat::Mp3 }
     };
 
     let final_output_path = output_path_opt.unwrap_or_else(|| {
@@ -626,7 +818,6 @@ fn print_header() {
 fn main() {
     print_header();
 
-    // 1. Проверяем или скачиваем FFmpeg
     let ffmpeg_paths = match ensure_ffmpeg_available() {
         Ok(paths) => paths,
         Err(e) => {
@@ -636,7 +827,6 @@ fn main() {
         }
     };
 
-    // 2. Парсим аргументы
     let (config, is_interactive) = match parse_args() {
         Ok(Some(res)) => res,
         Ok(None) => return,
@@ -650,26 +840,31 @@ fn main() {
     println!("\n Настройки:");
     println!(" ├ Вход:         {}", config.input_path.display());
     println!(" ├ Выход:        {}", config.output_path.display());
+    println!(" ├ Режим:        {}", if config.output_format.is_video() { "🎬 ВИДЕО + АУДИО" } else { "🎵 ТОЛЬКО АУДИО" });
     println!(" ├ Формат:       {}", config.output_format.as_ext().to_uppercase());
     println!(" ├ Порог:        {:.1} dB", config.noise_threshold_db);
     println!(" ├ Мин. пауза:   {:.2} сек", config.min_silence_sec);
     println!(" └ ИИ Расшифровка: {}", if config.ai_transcribe { "ВКЛЮЧЕНА" } else { "выключена" });
     println!("--------------------------------------------------");
 
-    // 3. Измеряем длительность
     let original_duration = get_file_duration(&config.input_path, &ffmpeg_paths).unwrap_or(0.0);
     if original_duration > 0.0 {
         println!("⏱ Исходная длительность: {}", format_duration(original_duration));
     }
 
-    // 4. Обработка
     let start_time = Instant::now();
-    match process_audio_file(&config, &ffmpeg_paths) {
+
+    let process_res = if config.output_format.is_video() {
+        process_video_file(&config, &ffmpeg_paths, original_duration)
+    } else {
+        process_audio_file(&config, &ffmpeg_paths)
+    };
+
+    match process_res {
         Ok(_) => {
             let elapsed = start_time.elapsed();
-            println!("\n✅ Аудио очищено за {:.2} сек!", elapsed.as_secs_f32());
+            println!("\n✅ Обработка завершена за {:.2} сек!", elapsed.as_secs_f32());
 
-            // 5. Вычисляем итоговые метрики
             let new_duration = get_file_duration(&config.output_path, &ffmpeg_paths).unwrap_or(0.0);
             if original_duration > 0.0 && new_duration > 0.0 {
                 let saved = original_duration - new_duration;
@@ -680,20 +875,34 @@ fn main() {
                 println!(" └ Вырезано тишины:        {} ({:.1}%)", format_duration(saved), percent);
             }
 
-            // 6. ИИ Расшифровка текста (если включена)
+            // ИИ Расшифровка текста (если включена)
             if config.ai_transcribe {
                 println!("\n--------------------------------------------------");
+                
+                // Если выходной файл — видео, подготавливаем легкий временный mp3 для передачи в API
+                let (stt_audio_path, is_temp) = if config.output_format.is_video() {
+                    match extract_temp_audio_for_stt(&config.output_path, &ffmpeg_paths) {
+                        Ok(p) => (p, true),
+                        Err(_) => (config.output_path.clone(), false),
+                    }
+                } else {
+                    (config.output_path.clone(), false)
+                };
+
                 let transcribe_res = if let Some(ref groq_key) = config.groq_api_key {
-                    transcribe_with_groq(&config.output_path, groq_key)
+                    transcribe_with_groq(&stt_audio_path, groq_key)
                 } else {
                     Err("Не указан API ключ (Groq)".to_string())
                 };
+
+                if is_temp {
+                    let _ = fs::remove_file(stt_audio_path);
+                }
 
                 match transcribe_res {
                     Ok(mut transcript) => {
                         println!("✅ Распознавание завершено!");
 
-                        // Если передали ключ DeepSeek, дополнительно отдаем ему на обработку
                         if let Some(ref ds_key) = config.deepseek_api_key {
                             match polish_text_with_deepseek(&transcript, ds_key) {
                                 Ok(polished) => transcript = polished,
@@ -701,9 +910,8 @@ fn main() {
                             }
                         }
 
-                        // Сохраняем рядом в .txt файл
                         let txt_path = config.output_path.with_extension("txt");
-                        if let Ok(_) = fs::write(&txt_path, &transcript) {
+                        if fs::write(&txt_path, &transcript).is_ok() {
                             println!("📄 Текст сохранен в: {}", txt_path.display());
                         }
                     }
