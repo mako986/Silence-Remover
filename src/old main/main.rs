@@ -57,7 +57,6 @@ struct AppConfig {
     output_format: MediaFormat,
     ai_transcribe: bool,     // Включить расшифровку через ИИ
     groq_api_key: Option<String>,
-    #[allow(dead_code)]
     gemini_api_key: Option<String>,
     deepseek_api_key: Option<String>,
 }
@@ -67,35 +66,6 @@ struct AppConfig {
 struct FfmpegPaths {
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
-}
-
-/// RAII-страж для автоматического удаления временного файла при выходе из области видимости
-struct TempFileGuard(PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// RAII-страж для автоматического удаления временной папки при выходе из области видимости
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Преобразует относительный путь в абсолютный относительно текущей рабочей директории
-fn to_absolute_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else if let Ok(cwd) = env::current_dir() {
-        cwd.join(path)
-    } else {
-        path.to_path_buf()
-    }
 }
 
 /// Автоматически скачивает FFmpeg в локальную папку `ffmpeg_bin`, если он не установлен
@@ -121,13 +91,8 @@ fn download_ffmpeg(bin_dir: &Path) -> Result<(), String> {
             bin_dir.display()
         );
 
-        let temp_script = env::temp_dir().join(format!("download_ffmpeg_{}.ps1", std::process::id()));
-        fs::write(&temp_script, &ps_script)
-            .map_err(|e| format!("Не удалось записать временный скрипт загрузки: {}", e))?;
-        let _guard = TempFileGuard(temp_script.clone());
-
         let status = Command::new("powershell")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", temp_script.to_str().unwrap()])
+            .args(["-NoProfile", "-Command", &ps_script])
             .status()
             .map_err(|e| format!("Ошибка выполнения PowerShell: {}", e))?;
 
@@ -149,13 +114,8 @@ fn download_ffmpeg(bin_dir: &Path) -> Result<(), String> {
             bin_dir.display()
         );
 
-        let temp_script = env::temp_dir().join(format!("download_ffmpeg_{}.sh", std::process::id()));
-        fs::write(&temp_script, &sh_script)
-            .map_err(|e| format!("Не удалось записать временный shell-скрипт: {}", e))?;
-        let _guard = TempFileGuard(temp_script.clone());
-
         let status = Command::new("sh")
-            .arg(temp_script.to_str().unwrap())
+            .args(["-c", &sh_script])
             .status()
             .map_err(|e| format!("Ошибка выполнения shell-скрипта: {}", e))?;
 
@@ -173,13 +133,8 @@ fn download_ffmpeg(bin_dir: &Path) -> Result<(), String> {
             bin_dir.display()
         );
 
-        let temp_script = env::temp_dir().join(format!("download_ffmpeg_{}.sh", std::process::id()));
-        fs::write(&temp_script, &sh_script)
-            .map_err(|e| format!("Не удалось записать временный shell-скрипт: {}", e))?;
-        let _guard = TempFileGuard(temp_script.clone());
-
         let status = Command::new("sh")
-            .arg(temp_script.to_str().unwrap())
+            .args(["-c", &sh_script])
             .status()
             .map_err(|e| format!("Ошибка выполнения shell-скрипта: {}", e))?;
 
@@ -369,7 +324,7 @@ fn compute_keep_intervals(silences: &[(f32, f32)], total_duration: f32) -> Vec<(
     keeps
 }
 
-/// Выполняет синхронный монтаж ВИДЕО и АУДИО с защитой от превышения длины командной строки (os error 206)
+/// Выполняет синхронный монтаж ВИДЕО и АУДИО
 fn process_video_file(config: &AppConfig, paths: &FfmpegPaths, total_duration: f32) -> Result<(), String> {
     let silences = detect_silence_intervals(&config.input_path, config.noise_threshold_db, config.min_silence_sec, paths)?;
     let keeps = compute_keep_intervals(&silences, total_duration);
@@ -387,129 +342,51 @@ fn process_video_file(config: &AppConfig, paths: &FfmpegPaths, total_duration: f
 
     println!("✂️ Нарезка и склейка {} фрагментов видео и аудио...", keeps.len());
 
-    const BATCH_SIZE: usize = 25;
+    let mut filter_script = String::new();
+    let mut concat_inputs = String::new();
 
-    let build_batch_filter = |batch: &[(f32, f32)]| -> String {
-        let mut filter = String::new();
-        let mut concat_inputs = String::new();
-
-        for (i, (start, end)) in batch.iter().enumerate() {
-            filter.push_str(&format!(
-                "[0:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS[v{}];\n",
-                start, end, i
-            ));
-            filter.push_str(&format!(
-                "[0:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS[a{}];\n",
-                start, end, i
-            ));
-            concat_inputs.push_str(&format!("[v{}][a{}]", i, i));
-        }
-
-        filter.push_str(&format!(
-            "{}concat=n={}:v=1:a=1[outv][outa]",
-            concat_inputs,
-            batch.len()
+    for (i, (start, end)) in keeps.iter().enumerate() {
+        filter_script.push_str(&format!(
+            "[0:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS[v{}];\n",
+            start, end, i
         ));
-        filter
-    };
-
-    let abs_input = to_absolute_path(&config.input_path);
-    let abs_output = to_absolute_path(&config.output_path);
-
-    // Если фрагментов немного (<= BATCH_SIZE), выполняем обработку за один вызов FFmpeg напрямую в выходной файл
-    if keeps.len() <= BATCH_SIZE {
-        let filter_str = build_batch_filter(&keeps);
-
-        let mut cmd = Command::new(&paths.ffmpeg);
-        cmd.arg("-y")
-           .arg("-i").arg(&abs_input)
-           .arg("-filter_complex").arg(&filter_str)
-           .arg("-map").arg("[outv]")
-           .arg("-map").arg("[outa]")
-           .arg("-c:v").arg("libx264")
-           .arg("-preset").arg("fast")
-           .arg("-crf").arg("22")
-           .arg("-c:a").arg("aac")
-           .arg("-b:a").arg("192k")
-           .arg(&abs_output);
-
-        let output = cmd.output().map_err(|e| format!("Ошибка запуска FFmpeg: {}", e))?;
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("FFmpeg завершился с ошибкой при монтаже видео:\n{}", err_msg));
-        }
-
-        return Ok(());
+        filter_script.push_str(&format!(
+            "[0:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS[a{}];\n",
+            start, end, i
+        ));
+        concat_inputs.push_str(&format!("[v{}][a{}]", i, i));
     }
 
-    // Если фрагментов много, разбиваем на батчи и склеиваем через concat demuxer (filelist.txt),
-    // чтобы предотвратить ошибку превышения длины командной строки (os error 206)
-    let temp_dir_path = env::temp_dir().join(format!("silence_remover_{}", std::process::id()));
-    fs::create_dir_all(&temp_dir_path)
-        .map_err(|e| format!("Не удалось создать временную директорию: {}", e))?;
-    let _temp_dir_guard = TempDirGuard(temp_dir_path.clone());
+    filter_script.push_str(&format!(
+        "{}concat=n={}:v=1:a=1[outv][outa]\n",
+        concat_inputs,
+        keeps.len()
+    ));
 
-    let total_batches = (keeps.len() + BATCH_SIZE - 1) / BATCH_SIZE;
-    println!("📦 Фрагменты разбиты на {} порций (батчей) по {} шт.", total_batches, BATCH_SIZE);
+    // Использование файла скрипта избегает ограничений Windows на длину командной строки
+    let script_path = env::temp_dir().join(format!("silence_filter_{}.txt", std::process::id()));
+    fs::write(&script_path, &filter_script)
+        .map_err(|e| format!("Ошибка записи файла скрипта фильтра: {}", e))?;
 
-    let mut part_files = Vec::new();
-    let ext = config.output_format.as_ext();
+    let mut cmd = Command::new(&paths.ffmpeg);
+    cmd.arg("-y")
+       .arg("-i").arg(&config.input_path)
+       .arg("-filter_complex_script").arg(&script_path)
+       .arg("-map").arg("[outv]")
+       .arg("-map").arg("[outa]")
+       .arg("-c:v").arg("libx264")
+       .arg("-preset").arg("fast")
+       .arg("-crf").arg("22")
+       .arg("-c:a").arg("aac")
+       .arg("-b:a").arg("192k")
+       .arg(&config.output_path);
 
-    for (b_idx, chunk) in keeps.chunks(BATCH_SIZE).enumerate() {
-        println!(" ├ Обработка батча {}/{} ({} фрагментов)...", b_idx + 1, total_batches, chunk.len());
+    let output = cmd.output().map_err(|e| format!("Ошибка запуска FFmpeg: {}", e))?;
+    let _ = fs::remove_file(script_path);
 
-        let part_filename = format!("part_{:04}.{}", b_idx, ext);
-        let filter_str = build_batch_filter(chunk);
-
-        let mut cmd = Command::new(&paths.ffmpeg);
-        cmd.current_dir(&temp_dir_path)
-           .arg("-y")
-           .arg("-i").arg(&abs_input)
-           .arg("-filter_complex").arg(&filter_str)
-           .arg("-map").arg("[outv]")
-           .arg("-map").arg("[outa]")
-           .arg("-c:v").arg("libx264")
-           .arg("-preset").arg("fast")
-           .arg("-crf").arg("22")
-           .arg("-c:a").arg("aac")
-           .arg("-b:a").arg("192k")
-           .arg(&part_filename);
-
-        let output = cmd.output().map_err(|e| format!("Ошибка запуска FFmpeg для батча {}: {}", b_idx + 1, e))?;
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("FFmpeg завершился с ошибкой в батче {}:\n{}", b_idx + 1, err_msg));
-        }
-
-        part_files.push(part_filename);
-    }
-
-    println!(" └ Склейка фрагментов через concat-файл (filelist.txt)...");
-
-    // Формируем concat-файл списка (filelist.txt) с относительными путями
-    let filelist_path = temp_dir_path.join("filelist.txt");
-    let mut filelist_content = String::new();
-    for part in &part_files {
-        filelist_content.push_str(&format!("file '{}'\n", part));
-    }
-
-    fs::write(&filelist_path, &filelist_content)
-        .map_err(|e| format!("Не удалось записать concat-файл списка: {}", e))?;
-
-    // Быстрая склейка через FFmpeg Concat Demuxer без повторного перекодирования (-c copy)
-    let mut concat_cmd = Command::new(&paths.ffmpeg);
-    concat_cmd.current_dir(&temp_dir_path)
-        .arg("-y")
-        .arg("-f").arg("concat")
-        .arg("-safe").arg("0")
-        .arg("-i").arg("filelist.txt")
-        .arg("-c").arg("copy")
-        .arg(&abs_output);
-
-    let concat_output = concat_cmd.output().map_err(|e| format!("Ошибка запуска склейки FFmpeg: {}", e))?;
-    if !concat_output.status.success() {
-        let err_msg = String::from_utf8_lossy(&concat_output.stderr);
-        return Err(format!("FFmpeg завершился с ошибкой при склейке concat:\n{}", err_msg));
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("FFmpeg завершился с ошибкой при монтаже видео:\n{}", err_msg));
     }
 
     Ok(())
@@ -528,13 +405,9 @@ fn extract_temp_audio_for_stt(media_path: &Path, paths: &FfmpegPaths) -> Result<
             temp_mp3.to_str().ok_or("Недопустимый путь temp")?,
         ])
         .output()
-        .map_err(|e| {
-            let _ = fs::remove_file(&temp_mp3);
-            format!("Ошибка экспорта аудио для ИИ: {}", e)
-        })?;
+        .map_err(|e| format!("Ошибка экспорта аудио для ИИ: {}", e))?;
 
     if !output.status.success() {
-        let _ = fs::remove_file(&temp_mp3);
         return Err("Не удалось извлечь аудиодорожку для ИИ-расшифровки.".to_string());
     }
     Ok(temp_mp3)
@@ -604,7 +477,6 @@ fn polish_text_with_deepseek(raw_text: &str, api_key: &str) -> Result<String, St
     );
 
     fs::write(&temp_json_path, json_body).map_err(|e| format!("Ошибка записи запроса: {}", e))?;
-    let _guard = TempFileGuard(temp_json_path.clone());
 
     let output = Command::new("curl")
         .args([
